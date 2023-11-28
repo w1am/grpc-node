@@ -16,43 +16,70 @@
  */
 
 import * as gulp from 'gulp';
-import * as healthCheck from './packages/grpc-health-check/gulpfile';
-import * as jsCore from './packages/grpc-js/gulpfile';
-import * as jsXds from './packages/grpc-js-xds/gulpfile';
-import * as protobuf from './packages/proto-loader/gulpfile';
-import * as internalTest from './test/gulpfile';
 
-const installAll = gulp.series(jsCore.install, healthCheck.install, protobuf.install, internalTest.install, jsXds.install);
+import * as mocha from 'gulp-mocha';
+import * as path from 'path';
+import * as execa from 'execa';
+import * as pify from 'pify';
+import * as semver from 'semver';
+import { ncp } from 'ncp';
 
-const lint = gulp.parallel(jsCore.lint);
+const ncpP = pify(ncp);
 
-const build = gulp.series(jsCore.compile, protobuf.compile, jsXds.compile);
+Error.stackTraceLimit = Infinity;
 
-const setup = gulp.series(installAll);
+const jsCoreDir = __dirname;
+const outDir = path.resolve(jsCoreDir, 'build');
 
-const setupPureJSInterop = gulp.series(jsCore.install, protobuf.install, internalTest.install);
+const pkgPath = path.resolve(jsCoreDir, 'package.json');
+const supportedVersionRange = require(pkgPath).engines.node;
+const versionNotSupported = () => {
+  console.log(`Skipping grpc-js task for Node ${process.version}`);
+  return () => { return Promise.resolve(); };
+};
+const identity = (value: any): any => value;
+const checkTask = semver.satisfies(process.version, supportedVersionRange) ?
+    identity : versionNotSupported;
 
-const clean = gulp.series(jsCore.clean, protobuf.clean, jsXds.clean);
+const execNpmVerb = (verb: string, ...args: string[]) =>
+  execa('npm', [verb, ...args], {cwd: jsCoreDir, stdio: 'inherit'});
+const execNpmCommand = execNpmVerb.bind(null, 'run');
 
-const cleanAll = gulp.series(jsXds.cleanAll, jsCore.cleanAll, internalTest.cleanAll, protobuf.cleanAll);
+const install = checkTask(() => execNpmVerb('install', '--unsafe-perm'));
 
-const nativeTestOnly = gulp.parallel(healthCheck.test);
+/**
+ * Runs tslint on files in src/, with linting rules defined in tslint.json.
+ */
+const lint = checkTask(() => execNpmCommand('check'));
 
-const nativeTest = gulp.series(build, nativeTestOnly);
+const cleanFiles = checkTask(() => execNpmCommand('clean'));
 
-const testOnly = gulp.parallel(jsCore.test, nativeTestOnly, protobuf.test, jsXds.test);
+const clean = gulp.series(install, cleanFiles);
 
-const test = gulp.series(build, testOnly, internalTest.test);
+const cleanAll = gulp.parallel(clean);
+
+/**
+ * Transpiles TypeScript files in src/ to JavaScript according to the settings
+ * found in tsconfig.json.
+ */
+const compile = checkTask(() => execNpmCommand('compile'));
+
+const copyTestFixtures = checkTask(() => ncpP(`${jsCoreDir}/test/fixtures`, `${outDir}/test/fixtures`));
+
+const runTests = checkTask(() => {
+  process.env.GRPC_EXPERIMENTAL_ENABLE_OUTLIER_DETECTION = 'true';
+  return gulp.src(`${outDir}/test/**/*.js`)
+    .pipe(mocha({reporter: 'mocha-jenkins-reporter',
+                 require: ['ts-node/register']}));
+});
+
+const test = gulp.series(install, copyTestFixtures, runTests);
 
 export {
-  installAll,
+  install,
   lint,
-  build,
-  setup,
-  setupPureJSInterop,
   clean,
   cleanAll,
-  nativeTestOnly,
-  nativeTest,
+  compile,
   test
-};
+}
